@@ -239,6 +239,21 @@ private struct TrafficLightAligner: NSViewRepresentable {
 
 // MARK: - Schema sidebar (multi-connection object tree)
 
+/// A tree row keyed by its full path — "connId|database|schema.relation" — rather
+/// than by the object's own name.
+///
+/// The whole tree is one lazy stack, so every nested `ForEach` in it shares a single
+/// identity space. Names alone are not unique across connections: two servers
+/// holding the same database ("llamacloud" on staging *and* production) each emit a
+/// row identified "llamacloud", SwiftUI treats them as the same row and keeps only
+/// one — and the survivor carries the *other* connection's id in its callbacks, so
+/// double-clicking a table opens it on the wrong connection. Path keys keep the two
+/// subtrees distinct.
+private struct TreeKey<Value>: Identifiable {
+    let id: String
+    let value: Value
+}
+
 private struct SchemaSidebar: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var store: ConnectionStore
@@ -392,8 +407,8 @@ private struct SchemaSidebar: View {
         .contextMenu { connectionMenu(conn, connected: connected) }
 
         if let session, expanded {
-            ForEach(session.databases, id: \.self) { dbName in
-                databaseNode(conn.id, session, dbName)
+            ForEach(session.databases.map { TreeKey(id: "\(conn.id)|\($0)", value: $0) }) { db in
+                databaseNode(conn.id, session, db.value)
             }
         }
     }
@@ -448,7 +463,8 @@ private struct SchemaSidebar: View {
                 }
             } else {
                 let schemaGroups = groups(s, dbName)
-                ForEach(schemaGroups, id: \.schema) { group in
+                ForEach(schemaGroups.map { TreeKey(id: "\(connId)|\(dbName)|\($0.schema)", value: $0) }) { entry in
+                    let group = entry.value
                     let key = "\(connId).\(dbName).\(group.schema)"
                     let expanded = !collapsedSchemas.contains(key)
                     TreeRow(depth: 2, icon: "shippingbox", label: group.schema,
@@ -459,7 +475,8 @@ private struct SchemaSidebar: View {
                             onOpen: { toggleSchema(key) })
 
                     if expanded {
-                        ForEach(group.relations) { rel in
+                        ForEach(group.relations.map { TreeKey(id: "\(connId)|\(dbName)|\($0.id)", value: $0) }) { entry in
+                            let rel = entry.value
                             TreeRow(depth: 3, icon: rel.kind.iconName, label: rel.name,
                                     trailing: (rel.kind == .table || rel.kind == .partitioned) ? Fmt.rows(rel.estRows) : nil,
                                     selected: model.selectedConnectionId == connId && model.selectedDatabase == dbName && model.selectedRelationID == rel.id,
