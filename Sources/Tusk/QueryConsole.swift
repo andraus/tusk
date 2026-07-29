@@ -64,7 +64,42 @@ enum WorkspaceTab: Identifiable, Equatable {
 // MARK: - On-disk persistence
 
 /// A restore-index entry describing one open console (its buffer lives in `<id>.sql`).
-private struct ConsoleIndexEntry: Codable {
+private struct PersistedColumnInfo: Codable {
+    let name: String
+    let type: String
+    let notNull: Bool
+    let isPK: Bool
+    let isFK: Bool
+}
+
+private struct WorkspaceIndexEntry: Codable {
+    let kind: String
+    let id: String
+    let connectionId: String
+    let database: String
+
+    var title: String?
+    var readOnly: Bool?
+    var columns: [String]?
+    var rows: [[String?]]?
+    var error: String?
+    var elapsedMs: Int?
+    var lastRunByClaude: Bool?
+
+    var relationSchema: String?
+    var relationName: String?
+    var relationKind: String?
+    var relationEstRows: Int64?
+    var columnInfos: [PersistedColumnInfo]?
+}
+
+private struct WorkspaceIndex: Codable {
+    var selected: String?
+    var tabs: [WorkspaceIndexEntry]
+}
+
+// The pre-workspace format, retained so existing query tabs migrate on first launch.
+private struct LegacyConsoleIndexEntry: Codable {
     let id: String
     let connectionId: String
     let database: String
@@ -72,9 +107,9 @@ private struct ConsoleIndexEntry: Codable {
     var readOnly: Bool = false
 }
 
-private struct ConsoleIndex: Codable {
+private struct LegacyConsoleIndex: Codable {
     var selected: String?
-    var consoles: [ConsoleIndexEntry] = []
+    var consoles: [LegacyConsoleIndexEntry] = []
 }
 
 /// File-backed persistence for query consoles. All I/O is best-effort: a failure
@@ -101,34 +136,85 @@ enum ConsoleStore {
         try? FileManager.default.removeItem(at: fileURL(id: id))
     }
 
-    /// Persist the set of open consoles + the selected one for restore.
-    static func writeIndex(consoles: [QueryConsole], selected: String?) {
+    /// Persist all open tabs, their latest data/results, order, and selection.
+    static func writeIndex(tabs: [WorkspaceTab], selected: String?) {
         ensureDir()
-        let idx = ConsoleIndex(
-            selected: selected,
-            consoles: consoles.map {
-                ConsoleIndexEntry(id: $0.id, connectionId: $0.connectionId,
-                                  database: $0.database, title: $0.title, readOnly: $0.readOnly)
+        let entries = tabs.map { tab -> WorkspaceIndexEntry in
+            switch tab {
+            case .console(let c):
+                return WorkspaceIndexEntry(
+                    kind: "console", id: c.id, connectionId: c.connectionId, database: c.database,
+                    title: c.title, readOnly: c.readOnly, columns: c.columns, rows: c.rows,
+                    error: c.error, elapsedMs: c.elapsedMs, lastRunByClaude: c.lastRunByClaude
+                )
+            case .data(let t):
+                return WorkspaceIndexEntry(
+                    kind: "data", id: t.id, connectionId: t.connectionId, database: t.database,
+                    columns: t.columns, rows: t.rows, error: t.error,
+                    relationSchema: t.relation.schema, relationName: t.relation.name,
+                    relationKind: t.relation.kind.rawValue, relationEstRows: t.relation.estRows,
+                    columnInfos: t.columnInfos.map {
+                        PersistedColumnInfo(name: $0.name, type: $0.type, notNull: $0.notNull,
+                                            isPK: $0.isPK, isFK: $0.isFK)
+                    }
+                )
             }
+        }
+        let idx = WorkspaceIndex(
+            selected: selected,
+            tabs: entries
         )
         do { try JSONEncoder().encode(idx).write(to: indexURL, options: .atomic) }
-        catch { NSLog("Tusk: couldn't persist console index: \(error.localizedDescription)") }
+        catch { NSLog("Tusk: couldn't persist workspace index: \(error.localizedDescription)") }
     }
 
-    /// Restore the consoles saved for a given connection (their buffers read back
-    /// from disk). Consoles for other connections are left untouched on disk.
-    /// Returns the restored consoles and which one was selected (if it's among them).
-    static func restore(connectionId: String) -> (consoles: [QueryConsole], selected: String?) {
-        guard let data = try? Data(contentsOf: indexURL),
-              let idx = try? JSONDecoder().decode(ConsoleIndex.self, from: data) else {
+    /// Restore tabs saved for one connection. Query buffers remain in their `.sql`
+    /// files so upgrades from the original console-only format are lossless.
+    static func restore(connectionId: String) -> (tabs: [WorkspaceTab], selected: String?) {
+        guard let data = try? Data(contentsOf: indexURL) else { return ([], nil) }
+        if let idx = try? JSONDecoder().decode(WorkspaceIndex.self, from: data) {
+            let restored = idx.tabs.compactMap { entry -> WorkspaceTab? in
+                guard entry.connectionId == connectionId else { return nil }
+                if entry.kind == "console" {
+                    let sql = (try? String(contentsOf: fileURL(id: entry.id), encoding: .utf8)) ?? ""
+                    return .console(QueryConsole(
+                        id: entry.id, connectionId: entry.connectionId, database: entry.database,
+                        title: entry.title ?? QueryConsole.deriveTitle(sql: sql), sql: sql,
+                        columns: entry.columns ?? [], rows: entry.rows ?? [], running: false,
+                        error: entry.error, elapsedMs: entry.elapsedMs,
+                        lastRunByClaude: entry.lastRunByClaude ?? false, readOnly: entry.readOnly ?? false
+                    ))
+                }
+                guard entry.kind == "data", let schema = entry.relationSchema,
+                      let name = entry.relationName else { return nil }
+                let relation = Relation(
+                    schema: schema, name: name,
+                    kind: DBObjectKind(rawValue: entry.relationKind ?? "") ?? .table,
+                    estRows: entry.relationEstRows ?? 0
+                )
+                return .data(DataTab(
+                    id: entry.id, connectionId: entry.connectionId, database: entry.database,
+                    relation: relation, columns: entry.columns ?? [],
+                    columnInfos: (entry.columnInfos ?? []).map {
+                        ColumnInfo(name: $0.name, type: $0.type, notNull: $0.notNull,
+                                   isPK: $0.isPK, isFK: $0.isFK)
+                    },
+                    rows: entry.rows ?? [], loading: false, error: entry.error
+                ))
+            }
+            let selected = restored.contains(where: { $0.id == idx.selected }) ? idx.selected : restored.first?.id
+            return (restored, selected)
+        }
+
+        guard let idx = try? JSONDecoder().decode(LegacyConsoleIndex.self, from: data) else {
             return ([], nil)
         }
-        var restored: [QueryConsole] = []
+        var restored: [WorkspaceTab] = []
         for entry in idx.consoles where entry.connectionId == connectionId {
             let sql = (try? String(contentsOf: fileURL(id: entry.id), encoding: .utf8)) ?? ""
-            restored.append(QueryConsole(id: entry.id, connectionId: entry.connectionId,
-                                         database: entry.database, title: entry.title,
-                                         sql: sql, readOnly: entry.readOnly))
+            restored.append(.console(QueryConsole(id: entry.id, connectionId: entry.connectionId,
+                                                   database: entry.database, title: entry.title,
+                                                   sql: sql, readOnly: entry.readOnly)))
         }
         let selected = restored.contains(where: { $0.id == idx.selected }) ? idx.selected : restored.first?.id
         return (restored, selected)

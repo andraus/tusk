@@ -338,6 +338,7 @@ final class AppModel: ObservableObject {
         activeTabID = id
         if tabs.contains(where: { $0.id == id }) { return }   // already open — just focus it
         tabs.append(.data(DataTab(id: id, connectionId: connId, database: database, relation: relation)))
+        scheduleConsolePersist()
         loadRows(for: id, connId: connId, database: database, relation: relation)
     }
 
@@ -368,10 +369,8 @@ final class AppModel: ObservableObject {
                 if closing.asConsole != nil { await db.closeConsole(id) } else { await db.closeTab(id) }
             }
         }
-        if closing.asConsole != nil {
-            ConsoleStore.remove(id: id)
-            scheduleConsolePersist()
-        }
+        if closing.asConsole != nil { ConsoleStore.remove(id: id) }
+        scheduleConsolePersist()
         if activeTabID == id {
             let next = tabs[safe: idx] ?? tabs[safe: idx - 1]
             if let next { focusTab(next.id) } else { activeTabID = nil }
@@ -398,8 +397,10 @@ final class AppModel: ObservableObject {
                     $0.rows = set.rows
                     $0.loading = false
                 }
+                scheduleConsolePersist()
             } catch {
                 updateDataTab(id) { $0.error = error.localizedDescription; $0.loading = false }
+                scheduleConsolePersist()
             }
         }
     }
@@ -436,8 +437,10 @@ final class AppModel: ObservableObject {
                     if rowIndex < $0.rows.count, $0.rows[rowIndex] == row { $0.rows.remove(at: rowIndex) }
                     $0.error = nil
                 }
+                scheduleConsolePersist()
             } catch {
                 updateDataTab(id) { $0.error = error.localizedDescription }
+                scheduleConsolePersist()
             }
         }
     }
@@ -522,8 +525,10 @@ final class AppModel: ObservableObject {
                 $0.columns = set.columns; $0.rows = set.rows
                 $0.running = false; $0.error = nil; $0.elapsedMs = ms
             }
+            scheduleConsolePersist()
         } catch {
             updateConsole(id) { $0.running = false; $0.error = error.localizedDescription; $0.elapsedMs = nil }
+            scheduleConsolePersist()
         }
     }
 
@@ -578,13 +583,13 @@ final class AppModel: ObservableObject {
     private func flushConsolePersist() {
         let cs = consoles
         for c in cs { ConsoleStore.writeSQL(id: c.id, sql: c.sql) }
-        ConsoleStore.writeIndex(consoles: cs, selected: activeTabID)
+        ConsoleStore.writeIndex(tabs: tabs, selected: activeTabID)
     }
 
     private func restoreConsoles(for connectionId: String) {
         let (restored, selected) = ConsoleStore.restore(connectionId: connectionId)
         guard !restored.isEmpty else { return }
-        for c in restored where !tabs.contains(where: { $0.id == c.id }) { tabs.append(.console(c)) }
+        for tab in restored where !tabs.contains(where: { $0.id == tab.id }) { tabs.append(tab) }
         if activeTabID == nil, let selected { activeTabID = selected }
     }
 
