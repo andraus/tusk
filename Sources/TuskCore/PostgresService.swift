@@ -309,37 +309,33 @@ public actor PGConnection {
 
 // MARK: - Connection lanes
 
-/// Manages the connection lanes for a session. Browsing (the object tree + the
-/// inspector) shares one serialized lane per database; each data tab gets its own
-/// dedicated lane. Requests within a lane are sequenced; lanes run concurrently.
+/// Manages the connection lanes for a session. ALL operations for a given database
+/// — tree browsing, data tabs, and query consoles — share one serialized connection
+/// for that database, keyed by database name. Different databases each get their
+/// own connection (one per database). Requests within a lane are sequenced; lanes
+/// run concurrently.
 public actor Database {
     private var baseConfig: Connection?
-    private var browse: [String: PGConnection] = [:]   // keyed by database
-    private var tabLanes: [String: PGConnection] = [:]  // keyed by tab id
-    private var consoleLanes: [String: PGConnection] = [:]  // keyed by query-console id
+    private var lanes: [String: PGConnection] = [:]   // one connection per database
 
     public init() {}
 
     // MARK: Lifecycle
 
-    /// Open the workspace connection (the browse lane for the connected database).
+    /// Open the workspace connection (the shared lane for the connected database).
     public func open(_ cfg: Connection) async throws {
         await closeAll()
         baseConfig = cfg
         let c = PGConnection(cfg)
         try await c.connect()
-        browse[cfg.database] = c
+        lanes[cfg.database] = c
     }
 
     public func close() async { await closeAll() }
 
     private func closeAll() async {
-        for (_, c) in browse { await c.close() }
-        for (_, c) in tabLanes { await c.close() }
-        for (_, c) in consoleLanes { await c.close() }
-        browse = [:]
-        tabLanes = [:]
-        consoleLanes = [:]
+        for (_, c) in lanes { await c.close() }
+        lanes = [:]
         baseConfig = nil
     }
 
@@ -358,87 +354,66 @@ public actor Database {
         }
     }
 
-    // MARK: Browse lane (object tree + inspector)
-
-    private func browseLane(_ database: String) throws -> PGConnection {
-        if let c = browse[database] { return c }
+    /// The shared connection for `database`, created on first use. This is the only
+    /// lane: browsing, data tabs, and consoles all ride it, so the server sees at
+    /// most one connection per database per user.
+    private func lane(_ database: String) throws -> PGConnection {
+        if let c = lanes[database] { return c }
         guard let cfg0 = baseConfig else { throw PGError.notConnected }
         var cfg = cfg0; cfg.database = database
         let c = PGConnection(cfg)
-        browse[database] = c
+        lanes[database] = c
         return c
     }
 
     public func databases() async throws -> [String] {
         guard let cfg = baseConfig else { throw PGError.notConnected }
-        return try await browseLane(cfg.database).databases()
+        return try await lane(cfg.database).databases()
     }
 
     public func snapshot(database: String) async throws -> DBSnapshot {
-        try await browseLane(database).snapshot()
+        try await lane(database).snapshot()
     }
 
     public func columns(database: String, schema: String, table: String) async throws -> [ColumnInfo] {
-        try await browseLane(database).columns(schema: schema, table: table)
+        try await lane(database).columns(schema: schema, table: table)
     }
 
-    /// Liveness of the active browse connection.
+    /// Liveness of the connected database's shared connection.
     public func ping() async -> Bool {
-        guard let cfg = baseConfig, let c = browse[cfg.database] else { return false }
+        guard let cfg = baseConfig, let c = lanes[cfg.database] else { return false }
         return await c.ping()
     }
 
-    // MARK: Per-tab data lanes (center pane)
-
-    private func tabLane(_ tab: String, database: String) throws -> PGConnection {
-        if let c = tabLanes[tab] { return c }
-        guard let cfg0 = baseConfig else { throw PGError.notConnected }
-        var cfg = cfg0; cfg.database = database
-        let c = PGConnection(cfg)
-        tabLanes[tab] = c
-        return c
-    }
+    // MARK: Data tabs (share the database's connection)
 
     public func tabColumns(tab: String, database: String, schema: String, table: String) async throws -> [ColumnInfo] {
-        try await tabLane(tab, database: database).columns(schema: schema, table: table)
+        try await lane(database).columns(schema: schema, table: table)
     }
 
     public func tabRows(tab: String, database: String, schema: String, table: String, limit: Int = 200) async throws -> RowSet {
-        try await tabLane(tab, database: database).rows(schema: schema, table: table, limit: limit)
+        try await lane(database).rows(schema: schema, table: table, limit: limit)
     }
 
-    /// Delete a row in a data tab's table, on that tab's dedicated lane.
+    /// Delete a row in a data tab's table, on the database's shared connection.
     public func tabDeleteRow(tab: String, database: String, schema: String, table: String,
                              columns: [String], values: [String?]) async throws {
-        _ = try await tabLane(tab, database: database)
+        _ = try await lane(database)
             .deleteRow(schema: schema, table: table, columns: columns, values: values)
     }
 
-    /// Close and drop a tab's dedicated connection.
-    public func closeTab(_ tab: String) async {
-        if let c = tabLanes.removeValue(forKey: tab) { await c.close() }
-    }
+    /// Tabs no longer own connections — they share the database's lane — so there is
+    /// nothing to close. Kept for call-site compatibility.
+    public func closeTab(_ tab: String) async {}
 
-    // MARK: - Per-console lanes (query console)
+    // MARK: Query consoles (share the database's connection)
 
-    /// One dedicated connection per query console, bound to the console's database —
-    /// so each console runs on its own connection independent of the browse/data lanes.
-    private func consoleLane(_ console: String, database: String) throws -> PGConnection {
-        if let c = consoleLanes[console] { return c }
-        guard let cfg0 = baseConfig else { throw PGError.notConnected }
-        var cfg = cfg0; cfg.database = database
-        let c = PGConnection(cfg)
-        consoleLanes[console] = c
-        return c
-    }
-
-    /// Execute a console's SQL on its dedicated lane.
+    /// Execute a console's SQL on the database's shared connection.
     public func runConsole(_ console: String, database: String, sql: String, readOnly: Bool = false) async throws -> RowSet {
-        try await consoleLane(console, database: database).query(sql, readOnly: readOnly)
+        try await lane(database).query(sql, readOnly: readOnly)
     }
 
-    /// Close and drop a console's dedicated connection.
-    public func closeConsole(_ console: String) async {
-        if let c = consoleLanes.removeValue(forKey: console) { await c.close() }
-    }
+    /// Consoles no longer own connections — they share the database's lane — so there
+    /// is nothing to close. Kept for call-site compatibility.
+    public func closeConsole(_ console: String) async {}
 }
